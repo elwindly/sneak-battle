@@ -40,14 +40,23 @@ Open [localhost:8000](http://localhost:8000) in your browser and you should see
 
 ## Play a Game Locally
 
-Install the [Battlesnake CLI](https://github.com/BattlesnakeOfficial/rules/tree/main/cli)
-* You can [download compiled binaries here](https://github.com/BattlesnakeOfficial/rules/releases)
-* or [install as a go package](https://github.com/BattlesnakeOfficial/rules/tree/main/cli#installation) (requires Go 1.18 or higher)
+Install the [Battlesnake CLI](https://github.com/BattlesnakeOfficial/rules/tree/main/cli):
 
-Command to run a local game
+* **Precompiled (recommended):** [Download the Windows binary](https://github.com/BattlesnakeOfficial/rules/releases) (e.g. `battlesnake_*_Windows_x86_64.tar.gz`), extract it, then **add the folder containing `battlesnake.exe` to your PATH** so the `battlesnake` command works in any terminal.
+* **With Go:** `go install github.com/BattlesnakeOfficial/rules/cli/battlesnake@latest` (requires Go 1.18+). Ensure your Go bin directory (e.g. `%USERPROFILE%\go\bin`) is in your PATH.
+
+**If `battlesnake` is not recognized on Windows:** The CLI is not an npm package. After installing, the folder that contains `battlesnake.exe` must be in your system PATH. To add it: **Settings → System → About → Advanced system settings → Environment Variables → Path → Edit → New**, then add the full path to the folder where `battlesnake.exe` lives. Restart your terminal (or VS Code) after changing PATH.
+
+Command to run a local game (with your snake already running via `npm run start`):
 
 ```sh
 battlesnake play -W 11 -H 11 --name 'TypeScript Starter Project' --url http://localhost:8000 -g solo --browser
+```
+
+Or use the project script (still requires the CLI on PATH):
+
+```sh
+npm run play
 ```
 
 ## Next Steps
