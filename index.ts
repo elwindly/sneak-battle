@@ -13,8 +13,10 @@
 import runServer from './server';
 import { Coord, GameState, InfoResponse, MoveResponse } from './types';
 
-const HEALTH_FOOD_THRESHOLD = 50;
+const HEALTH_FOOD_THRESHOLD = 70;
 const MIN_FLOOD_FILL_SPACE = 3;
+/** Min space around a food cell to consider it (avoid eating into a trap). */
+const MIN_SPACE_AROUND_FOOD = 2;
 
 const DIRECTIONS = ['up', 'down', 'left', 'right'] as const;
 type Direction = (typeof DIRECTIONS)[number];
@@ -133,6 +135,15 @@ function floodFillCount(
   return count;
 }
 
+/** Direction from head to the first step of path (path[0] must be adjacent to head). */
+function pathToDirection(head: Coord, firstStep: Coord): Direction | null {
+  if (firstStep.x === head.x && firstStep.y === head.y + 1) return 'up';
+  if (firstStep.x === head.x && firstStep.y === head.y - 1) return 'down';
+  if (firstStep.x === head.x - 1 && firstStep.y === head.y) return 'left';
+  if (firstStep.x === head.x + 1 && firstStep.y === head.y) return 'right';
+  return null;
+}
+
 // info is called when you create your Battlesnake on play.battlesnake.com
 // and controls your Battlesnake's appearance
 // TIP: If you open your Battlesnake URL in a browser you should see this data
@@ -200,41 +211,47 @@ function move(gameState: GameState): MoveResponse {
     return { move: 'down' };
   }
 
-  // Food targeting when health is low: A* to nearest reachable food
-  let preferredDirection: Direction | null = null;
-  if (you.health <= HEALTH_FOOD_THRESHOLD && food.length > 0) {
-    const blockedForPath = getBlockedSet(gameState, true);
+  const blockedForPath = getBlockedSet(gameState, true);
+  const blockedForFlood = getBlockedSet(gameState, true);
+
+  // Always pick a best food: shortest reachable path, can survive (path length < health), not a trap
+  let bestFoodDirection: Direction | null = null;
+  if (food.length > 0) {
     let bestPathLength = Infinity;
     for (const f of food) {
       const path = aStarPath(myHead, f, width, height, blockedForPath);
-      if (path.length > 0 && path.length < you.health && path.length < bestPathLength) {
+      if (path.length === 0 || path.length >= you.health) continue;
+      const spaceAtFood = floodFillCount(f, width, height, blockedForFlood);
+      if (spaceAtFood < MIN_SPACE_AROUND_FOOD) continue;
+      if (path.length < bestPathLength) {
         bestPathLength = path.length;
-        const first = path[0];
-        if (first.x === myHead.x && first.y === myHead.y + 1) preferredDirection = 'up';
-        else if (first.x === myHead.x && first.y === myHead.y - 1) preferredDirection = 'down';
-        else if (first.x === myHead.x - 1 && first.y === myHead.y) preferredDirection = 'left';
-        else if (first.x === myHead.x + 1 && first.y === myHead.y) preferredDirection = 'right';
+        bestFoodDirection = pathToDirection(myHead, path[0]);
       }
     }
   }
 
-  // Flood fill: prefer moves with more reachable space; eliminate traps
-  const blockedForFlood = getBlockedSet(gameState, true);
-  const scored: { move: Direction; space: number }[] = [];
+  const lowHealth = you.health <= HEALTH_FOOD_THRESHOLD;
+
+  // Flood fill + food preference: score each safe move
+  const scored: { move: Direction; space: number; towardFood: boolean }[] = [];
   for (const dir of safeMoves) {
     const nextHead = getNeighbor(myHead, dir);
     const space = floodFillCount(nextHead, width, height, blockedForFlood);
     if (space >= MIN_FLOOD_FILL_SPACE) {
-      scored.push({ move: dir, space });
+      scored.push({ move: dir, space, towardFood: dir === bestFoodDirection });
     }
   }
 
-  const candidates = scored.length > 0 ? scored : safeMoves.map((m) => ({ move: m, space: 0 }));
-  candidates.sort((a, b) => b.space - a.space);
+  const candidates = scored.length > 0 ? scored : safeMoves.map((m) => ({ move: m, space: 0, towardFood: false }));
+  // Sort: by space (desc), then by towardFood (true first) so we drift toward food when space is equal
+  candidates.sort((a, b) => {
+    if (b.space !== a.space) return b.space - a.space;
+    return (b.towardFood ? 1 : 0) - (a.towardFood ? 1 : 0);
+  });
 
   let nextMove: Direction;
-  if (preferredDirection && candidates.some((c) => c.move === preferredDirection)) {
-    nextMove = preferredDirection;
+  if (lowHealth && bestFoodDirection && candidates.some((c) => c.move === bestFoodDirection)) {
+    nextMove = bestFoodDirection;
   } else if (candidates.length > 0) {
     nextMove = candidates[0].move;
   } else {
