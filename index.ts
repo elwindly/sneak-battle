@@ -17,6 +17,8 @@ const HEALTH_FOOD_THRESHOLD = 70;
 const MIN_FLOOD_FILL_SPACE = 3;
 /** Min space around a food cell to consider it (avoid eating into a trap). */
 const MIN_SPACE_AROUND_FOOD = 2;
+const HEAD_TO_HEAD_KILL_BONUS = 5;
+const HEAD_TO_HEAD_RISK_PENALTY = 10;
 
 const DIRECTIONS = ['up', 'down', 'left', 'right'] as const;
 type Direction = (typeof DIRECTIONS)[number];
@@ -144,6 +146,30 @@ function pathToDirection(head: Coord, firstStep: Coord): Direction | null {
   return null;
 }
 
+function getHazardSet(gameState: GameState): Set<string> {
+  const hazards = new Set<string>();
+  for (const h of gameState.board.hazards) {
+    hazards.add(coordKey(h));
+  }
+  return hazards;
+}
+
+/** For each cell an opponent head could move to next turn, track the longest opponent that could arrive. */
+function getOpponentPossibleHeadMoves(gameState: GameState): Map<string, number> {
+  const result = new Map<string, number>();
+  const { board, you } = gameState;
+  for (const snake of board.snakes) {
+    if (snake.id === you.id) continue;
+    for (const dir of DIRECTIONS) {
+      const next = getNeighbor(snake.head, dir);
+      if (!inBounds(next, board.width, board.height)) continue;
+      const key = coordKey(next);
+      result.set(key, Math.max(result.get(key) ?? 0, snake.length));
+    }
+  }
+  return result;
+}
+
 // info is called when you create your Battlesnake on play.battlesnake.com
 // and controls your Battlesnake's appearance
 // TIP: If you open your Battlesnake URL in a browser you should see this data
@@ -152,10 +178,10 @@ function info(): InfoResponse {
 
   return {
     apiversion: "1",
-    author: "",       // TODO: Your Battlesnake Username
-    color: "#888888", // TODO: Choose color
-    head: "default",  // TODO: Choose head
-    tail: "default",  // TODO: Choose tail
+    author: "elwindly",
+    color: "#007A33",
+    head: "dragon",
+    tail: "flame",
   };
 }
 
@@ -177,6 +203,7 @@ function move(gameState: GameState): MoveResponse {
   const { width, height, food } = board;
   const myHead = you.body[0];
   const myNeck = you.body[1];
+  const hazardDmg = gameState.game.ruleset.settings.hazardDamagePerTurn;
 
   const isMoveSafe: Record<Direction, boolean> = {
     up: true,
@@ -213,14 +240,19 @@ function move(gameState: GameState): MoveResponse {
 
   const blockedForPath = getBlockedSet(gameState, true);
   const blockedForFlood = getBlockedSet(gameState, true);
+  const hazardSet = getHazardSet(gameState);
+  const opponentHeadMoves = getOpponentPossibleHeadMoves(gameState);
 
-  // Always pick a best food: shortest reachable path, can survive (path length < health), not a trap
+  // Food seeking: shortest reachable path, accounting for hazard damage along the way
   let bestFoodDirection: Direction | null = null;
   if (food.length > 0) {
     let bestPathLength = Infinity;
     for (const f of food) {
       const path = aStarPath(myHead, f, width, height, blockedForPath);
-      if (path.length === 0 || path.length >= you.health) continue;
+      if (path.length === 0) continue;
+      const hazardSteps = path.filter((c) => hazardSet.has(coordKey(c))).length;
+      const effectiveCost = path.length + hazardSteps * hazardDmg;
+      if (effectiveCost >= you.health) continue;
       const spaceAtFood = floodFillCount(f, width, height, blockedForFlood);
       if (spaceAtFood < MIN_SPACE_AROUND_FOOD) continue;
       if (path.length < bestPathLength) {
@@ -230,32 +262,76 @@ function move(gameState: GameState): MoveResponse {
     }
   }
 
-  const lowHealth = you.health <= HEALTH_FOOD_THRESHOLD;
+  const onHazard = hazardSet.has(coordKey(myHead));
+  const adjustedThreshold = onHazard
+    ? Math.min(HEALTH_FOOD_THRESHOLD + hazardDmg * 3, 100)
+    : HEALTH_FOOD_THRESHOLD;
+  const lowHealth = you.health <= adjustedThreshold;
 
-  // Flood fill + food preference: score each safe move
-  const scored: { move: Direction; space: number; towardFood: boolean }[] = [];
+  // Score each safe move: flood fill, food, hazards, head-to-head
+  const scored: {
+    move: Direction;
+    space: number;
+    towardFood: boolean;
+    hazardCost: number;
+    headToHeadScore: number;
+  }[] = [];
   for (const dir of safeMoves) {
     const nextHead = getNeighbor(myHead, dir);
+    const nextKey = coordKey(nextHead);
     const space = floodFillCount(nextHead, width, height, blockedForFlood);
-    if (space >= MIN_FLOOD_FILL_SPACE) {
-      scored.push({ move: dir, space, towardFood: dir === bestFoodDirection });
+    if (space < MIN_FLOOD_FILL_SPACE) continue;
+
+    const hazardCost = hazardSet.has(nextKey) ? Math.max(hazardDmg, 1) : 0;
+
+    let headToHeadScore = 0;
+    const opponentMaxLength = opponentHeadMoves.get(nextKey);
+    if (opponentMaxLength !== undefined) {
+      headToHeadScore = you.length > opponentMaxLength
+        ? HEAD_TO_HEAD_KILL_BONUS
+        : -HEAD_TO_HEAD_RISK_PENALTY;
     }
+
+    scored.push({
+      move: dir,
+      space,
+      towardFood: dir === bestFoodDirection,
+      hazardCost,
+      headToHeadScore,
+    });
   }
 
-  const candidates = scored.length > 0 ? scored : safeMoves.map((m) => ({ move: m, space: 0, towardFood: false }));
-  // Sort: by space (desc), then by towardFood (true first) so we drift toward food when space is equal
+  const candidates = scored.length > 0
+    ? scored
+    : safeMoves.map((m) => ({
+        move: m,
+        space: 0,
+        towardFood: false,
+        hazardCost: 0,
+        headToHeadScore: 0,
+      }));
+
   candidates.sort((a, b) => {
     if (b.space !== a.space) return b.space - a.space;
+    if (b.headToHeadScore !== a.headToHeadScore) return b.headToHeadScore - a.headToHeadScore;
+    if (a.hazardCost !== b.hazardCost) return a.hazardCost - b.hazardCost;
     return (b.towardFood ? 1 : 0) - (a.towardFood ? 1 : 0);
   });
 
   let nextMove: Direction;
   if (lowHealth && bestFoodDirection && candidates.some((c) => c.move === bestFoodDirection)) {
     nextMove = bestFoodDirection;
-  } else if (candidates.length > 0) {
-    nextMove = candidates[0].move;
   } else {
-    nextMove = safeMoves[0];
+    const killMove = candidates.find(
+      (c) => c.headToHeadScore > 0 && c.space >= you.length
+    );
+    if (killMove && !lowHealth) {
+      nextMove = killMove.move;
+    } else if (candidates.length > 0) {
+      nextMove = candidates[0].move;
+    } else {
+      nextMove = safeMoves[0];
+    }
   }
 
   console.log(`MOVE ${gameState.turn}: ${nextMove}`);
