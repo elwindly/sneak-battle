@@ -36,6 +36,10 @@ function indexToCoord(index: number, width: number): Coord {
   return { x: index % width, y: Math.floor(index / width) };
 }
 
+function coordKeyFromIdx(idx: number, width: number): string {
+  return `${idx % width},${Math.floor(idx / width)}`;
+}
+
 /** Binary min-heap on `f` for A* open set. */
 class MinFHeap {
   private readonly heap: { f: number; g: number; idx: number }[] = [];
@@ -173,32 +177,65 @@ function aStarPath(
   return [];
 }
 
-/** Flood fill from `from`: count reachable cells (4-neighbor), excluding blocked and out-of-bounds. */
+/**
+ * Flood fill from `from`: count reachable cells (4-neighbor), excluding blocked and out-of-bounds.
+ * Reuses `visitStamp` + `queue` with a per-pass `stamp` (increment between calls; wrap before 255).
+ * If `maxCount` is set, stops once count reaches that value (enough for "at least N" checks).
+ */
 function floodFillCount(
   from: Coord,
   width: number,
   height: number,
-  blocked: Set<string>
+  blocked: Set<string>,
+  visitStamp: Uint8Array,
+  stamp: number,
+  queue: Int32Array,
+  maxCount?: number
 ): number {
-  const visited = new Set<string>();
-  const queue: Coord[] = [from];
-  visited.add(coordKey(from));
+  const fromIdx = cellIndex(from, width);
+  if (blocked.has(coordKey(from))) return 0;
+
+  let qh = 0;
+  let qt = 0;
+  queue[qt++] = fromIdx;
+  visitStamp[fromIdx] = stamp;
   let count = 0;
-  while (queue.length > 0) {
-    const c = queue.shift()!;
+
+  while (qh < qt) {
+    const idx = queue[qh++]!;
     count++;
-    const neighbors: Coord[] = [
-      { x: c.x, y: c.y + 1 },
-      { x: c.x, y: c.y - 1 },
-      { x: c.x - 1, y: c.y },
-      { x: c.x + 1, y: c.y },
-    ];
-    for (const n of neighbors) {
-      if (!inBounds(n, width, height)) continue;
-      const k = coordKey(n);
-      if (blocked.has(k) || visited.has(k)) continue;
-      visited.add(k);
-      queue.push(n);
+    if (maxCount !== undefined && count >= maxCount) return count;
+
+    const x = idx % width;
+    const y = (idx / width) | 0;
+
+    if (y + 1 < height) {
+      const n = idx + width;
+      if (visitStamp[n] !== stamp && !blocked.has(coordKeyFromIdx(n, width))) {
+        visitStamp[n] = stamp;
+        queue[qt++] = n;
+      }
+    }
+    if (y > 0) {
+      const n = idx - width;
+      if (visitStamp[n] !== stamp && !blocked.has(coordKeyFromIdx(n, width))) {
+        visitStamp[n] = stamp;
+        queue[qt++] = n;
+      }
+    }
+    if (x > 0) {
+      const n = idx - 1;
+      if (visitStamp[n] !== stamp && !blocked.has(coordKeyFromIdx(n, width))) {
+        visitStamp[n] = stamp;
+        queue[qt++] = n;
+      }
+    }
+    if (x + 1 < width) {
+      const n = idx + 1;
+      if (visitStamp[n] !== stamp && !blocked.has(coordKeyFromIdx(n, width))) {
+        visitStamp[n] = stamp;
+        queue[qt++] = n;
+      }
     }
   }
   return count;
@@ -286,7 +323,7 @@ function move(gameState: GameState): MoveResponse {
   else if (myNeck.y > myHead.y) isMoveSafe.up = false;
 
   // Safety: bounds and collisions (other bodies; our body except tail which moves)
-  const blockedForSafety = getBlockedSet(gameState, true);
+  const blocked = getBlockedSet(gameState, true);
   for (const dir of DIRECTIONS) {
     if (!isMoveSafe[dir]) continue;
     const next = getNeighbor(myHead, dir);
@@ -294,7 +331,7 @@ function move(gameState: GameState): MoveResponse {
       isMoveSafe[dir] = false;
       continue;
     }
-    if (blockedForSafety.has(coordKey(next))) {
+    if (blocked.has(coordKey(next))) {
       isMoveSafe[dir] = false;
     }
   }
@@ -305,8 +342,17 @@ function move(gameState: GameState): MoveResponse {
     return { move: 'down' };
   }
 
-  const blockedForPath = getBlockedSet(gameState, true);
-  const blockedForFlood = getBlockedSet(gameState, true);
+  const floodVisitStamp = new Uint8Array(width * height);
+  const floodQueue = new Int32Array(width * height);
+  let floodStamp = 0;
+  const nextFloodStamp = (): number => {
+    if (++floodStamp >= 255) {
+      floodVisitStamp.fill(0);
+      floodStamp = 1;
+    }
+    return floodStamp;
+  };
+
   const hazardSet = getHazardSet(gameState);
   const opponentHeadMoves = getOpponentPossibleHeadMoves(gameState);
 
@@ -315,12 +361,21 @@ function move(gameState: GameState): MoveResponse {
   if (food.length > 0) {
     let bestPathLength = Infinity;
     for (const f of food) {
-      const path = aStarPath(myHead, f, width, height, blockedForPath);
+      const path = aStarPath(myHead, f, width, height, blocked);
       if (path.length === 0) continue;
       const hazardSteps = path.filter((c) => hazardSet.has(coordKey(c))).length;
       const effectiveCost = path.length + hazardSteps * hazardDmg;
       if (effectiveCost >= you.health) continue;
-      const spaceAtFood = floodFillCount(f, width, height, blockedForFlood);
+      const spaceAtFood = floodFillCount(
+        f,
+        width,
+        height,
+        blocked,
+        floodVisitStamp,
+        nextFloodStamp(),
+        floodQueue,
+        MIN_SPACE_AROUND_FOOD
+      );
       if (spaceAtFood < MIN_SPACE_AROUND_FOOD) continue;
       if (path.length < bestPathLength) {
         bestPathLength = path.length;
@@ -346,7 +401,15 @@ function move(gameState: GameState): MoveResponse {
   for (const dir of safeMoves) {
     const nextHead = getNeighbor(myHead, dir);
     const nextKey = coordKey(nextHead);
-    const space = floodFillCount(nextHead, width, height, blockedForFlood);
+    const space = floodFillCount(
+      nextHead,
+      width,
+      height,
+      blocked,
+      floodVisitStamp,
+      nextFloodStamp(),
+      floodQueue
+    );
     if (space < MIN_FLOOD_FILL_SPACE) continue;
 
     const hazardCost = hazardSet.has(nextKey) ? Math.max(hazardDmg, 1) : 0;
