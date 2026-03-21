@@ -27,6 +27,65 @@ function coordKey(c: Coord): string {
   return `${c.x},${c.y}`;
 }
 
+/** Packed cell id for grid maps (faster than string keys in hot paths). */
+function cellIndex(c: Coord, width: number): number {
+  return c.y * width + c.x;
+}
+
+function indexToCoord(index: number, width: number): Coord {
+  return { x: index % width, y: Math.floor(index / width) };
+}
+
+/** Binary min-heap on `f` for A* open set. */
+class MinFHeap {
+  private readonly heap: { f: number; g: number; idx: number }[] = [];
+
+  get length(): number {
+    return this.heap.length;
+  }
+
+  push(node: { f: number; g: number; idx: number }): void {
+    this.heap.push(node);
+    this.bubbleUp(this.heap.length - 1);
+  }
+
+  pop(): { f: number; g: number; idx: number } | undefined {
+    if (this.heap.length === 0) return undefined;
+    const min = this.heap[0];
+    const last = this.heap.pop()!;
+    if (this.heap.length > 0) {
+      this.heap[0] = last;
+      this.bubbleDown(0);
+    }
+    return min;
+  }
+
+  private bubbleUp(i: number): void {
+    const h = this.heap;
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (h[i]!.f >= h[p]!.f) break;
+      [h[i], h[p]] = [h[p]!, h[i]!];
+      i = p;
+    }
+  }
+
+  private bubbleDown(i: number): void {
+    const h = this.heap;
+    const n = h.length;
+    while (true) {
+      const l = i * 2 + 1;
+      const r = l + 1;
+      let smallest = i;
+      if (l < n && h[l]!.f < h[smallest]!.f) smallest = l;
+      if (r < n && h[r]!.f < h[smallest]!.f) smallest = r;
+      if (smallest === i) break;
+      [h[i], h[smallest]] = [h[smallest]!, h[i]!];
+      i = smallest;
+    }
+  }
+}
+
 function getNeighbor(head: Coord, move: Direction): Coord {
   switch (move) {
     case 'up':
@@ -67,40 +126,48 @@ function aStarPath(
   height: number,
   blocked: Set<string>
 ): Coord[] {
-  const key = (c: Coord) => coordKey(c);
+  const goalIdx = cellIndex(goal, width);
+  const startIdx = cellIndex(start, width);
   const heuristic = (c: Coord) => Math.abs(c.x - goal.x) + Math.abs(c.y - goal.y);
-  const open: { coord: Coord; g: number; f: number }[] = [{ coord: start, g: 0, f: heuristic(start) }];
-  const cameFrom = new Map<string, Coord>();
-  const gScore = new Map<string, number>();
-  gScore.set(key(start), 0);
+  const open = new MinFHeap();
+  const cameFrom = new Map<number, number>();
+  const gScore = new Map<number, number>();
+  gScore.set(startIdx, 0);
+  open.push({ idx: startIdx, g: 0, f: heuristic(start) });
+
+  const blockedAt = (c: Coord) => blocked.has(coordKey(c));
 
   while (open.length > 0) {
-    open.sort((a, b) => a.f - b.f);
-    const current = open.shift()!.coord;
-    if (current.x === goal.x && current.y === goal.y) {
+    const node = open.pop()!;
+    const { idx: currentIdx, g: currentG } = node;
+    if (currentG !== (gScore.get(currentIdx) ?? Infinity)) continue;
+
+    if (currentIdx === goalIdx) {
       const path: Coord[] = [];
-      let cur: Coord | undefined = current;
-      while (cur) {
-        path.unshift(cur);
-        cur = cameFrom.get(key(cur));
+      let cur = currentIdx;
+      while (cur !== startIdx) {
+        path.unshift(indexToCoord(cur, width));
+        cur = cameFrom.get(cur)!;
       }
-      return path.slice(1);
+      return path;
     }
 
+    const cx = currentIdx % width;
+    const cy = Math.floor(currentIdx / width);
     const neighbors: Coord[] = [
-      { x: current.x, y: current.y + 1 },
-      { x: current.x, y: current.y - 1 },
-      { x: current.x - 1, y: current.y },
-      { x: current.x + 1, y: current.y },
+      { x: cx, y: cy + 1 },
+      { x: cx, y: cy - 1 },
+      { x: cx - 1, y: cy },
+      { x: cx + 1, y: cy },
     ];
     for (const next of neighbors) {
-      if (!inBounds(next, width, height) || blocked.has(key(next))) continue;
-      const nextKey = key(next);
-      const tentativeG = (gScore.get(key(current)) ?? Infinity) + 1;
-      if (tentativeG >= (gScore.get(nextKey) ?? Infinity)) continue;
-      cameFrom.set(nextKey, current);
-      gScore.set(nextKey, tentativeG);
-      open.push({ coord: next, g: tentativeG, f: tentativeG + heuristic(next) });
+      if (!inBounds(next, width, height) || blockedAt(next)) continue;
+      const nextIdx = cellIndex(next, width);
+      const tentativeG = currentG + 1;
+      if (tentativeG >= (gScore.get(nextIdx) ?? Infinity)) continue;
+      cameFrom.set(nextIdx, currentIdx);
+      gScore.set(nextIdx, tentativeG);
+      open.push({ idx: nextIdx, g: tentativeG, f: tentativeG + heuristic(next) });
     }
   }
   return [];
