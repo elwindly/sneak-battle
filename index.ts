@@ -23,10 +23,6 @@ const HEAD_TO_HEAD_RISK_PENALTY = 10;
 const DIRECTIONS = ['up', 'down', 'left', 'right'] as const;
 type Direction = (typeof DIRECTIONS)[number];
 
-function coordKey(c: Coord): string {
-  return `${c.x},${c.y}`;
-}
-
 /** Packed cell id for grid maps (faster than string keys in hot paths). */
 function cellIndex(c: Coord, width: number): number {
   return c.y * width + c.x;
@@ -34,10 +30,6 @@ function cellIndex(c: Coord, width: number): number {
 
 function indexToCoord(index: number, width: number): Coord {
   return { x: index % width, y: Math.floor(index / width) };
-}
-
-function coordKeyFromIdx(idx: number, width: number): string {
-  return `${idx % width},${Math.floor(idx / width)}`;
 }
 
 /** Binary min-heap on `f` for A* open set. */
@@ -108,15 +100,16 @@ function inBounds(c: Coord, width: number, height: number): boolean {
 }
 
 /** Blocked cells for pathfinding/flood fill: all snake bodies. Our tail is excluded (it moves next turn unless we eat). */
-function getBlockedSet(gameState: GameState, excludeMyTail: boolean): Set<string> {
-  const blocked = new Set<string>();
+function getBlockedSet(gameState: GameState, excludeMyTail: boolean): Set<number> {
+  const blocked = new Set<number>();
   const { board, you } = gameState;
+  const { width } = board;
   for (const snake of board.snakes) {
     const body = snake.body;
     const tailIndex = body.length - 1;
     for (let i = 0; i < body.length; i++) {
       if (snake.id === you.id && excludeMyTail && i === tailIndex) continue;
-      blocked.add(coordKey(body[i]));
+      blocked.add(cellIndex(body[i], width));
     }
   }
   return blocked;
@@ -135,8 +128,8 @@ function aStarPath(
   goal: Coord,
   width: number,
   height: number,
-  blocked: Set<string>,
-  hazardSet: Set<string>,
+  blocked: Set<number>,
+  hazardSet: Set<number>,
   hazardDamagePerTurn: number
 ): { path: Coord[]; effectiveCost: number } {
   const goalIdx = cellIndex(goal, width);
@@ -148,9 +141,9 @@ function aStarPath(
   gScore.set(startIdx, 0);
   open.push({ idx: startIdx, g: 0, f: heuristic(start) });
 
-  const blockedAt = (c: Coord) => blocked.has(coordKey(c));
+  const blockedAt = (nextIdx: number) => blocked.has(nextIdx);
   const stepCost = (nextIdx: number) =>
-    1 + (hazardSet.has(coordKeyFromIdx(nextIdx, width)) ? hazardDamagePerTurn : 0);
+    1 + (hazardSet.has(nextIdx) ? hazardDamagePerTurn : 0);
 
   while (open.length > 0) {
     const node = open.pop()!;
@@ -176,8 +169,9 @@ function aStarPath(
       { x: cx + 1, y: cy },
     ];
     for (const next of neighbors) {
-      if (!inBounds(next, width, height) || blockedAt(next)) continue;
+      if (!inBounds(next, width, height)) continue;
       const nextIdx = cellIndex(next, width);
+      if (blockedAt(nextIdx)) continue;
       const edge = stepCost(nextIdx);
       const tentativeG = currentG + edge;
       if (tentativeG >= (gScore.get(nextIdx) ?? Infinity)) continue;
@@ -198,14 +192,14 @@ function floodFillCount(
   from: Coord,
   width: number,
   height: number,
-  blocked: Set<string>,
+  blocked: Set<number>,
   visitStamp: Uint8Array,
   stamp: number,
   queue: Int32Array,
   maxCount?: number
 ): number {
   const fromIdx = cellIndex(from, width);
-  if (blocked.has(coordKey(from))) return 0;
+  if (blocked.has(fromIdx)) return 0;
 
   let qh = 0;
   let qt = 0;
@@ -223,28 +217,28 @@ function floodFillCount(
 
     if (y + 1 < height) {
       const n = idx + width;
-      if (visitStamp[n] !== stamp && !blocked.has(coordKeyFromIdx(n, width))) {
+      if (visitStamp[n] !== stamp && !blocked.has(n)) {
         visitStamp[n] = stamp;
         queue[qt++] = n;
       }
     }
     if (y > 0) {
       const n = idx - width;
-      if (visitStamp[n] !== stamp && !blocked.has(coordKeyFromIdx(n, width))) {
+      if (visitStamp[n] !== stamp && !blocked.has(n)) {
         visitStamp[n] = stamp;
         queue[qt++] = n;
       }
     }
     if (x > 0) {
       const n = idx - 1;
-      if (visitStamp[n] !== stamp && !blocked.has(coordKeyFromIdx(n, width))) {
+      if (visitStamp[n] !== stamp && !blocked.has(n)) {
         visitStamp[n] = stamp;
         queue[qt++] = n;
       }
     }
     if (x + 1 < width) {
       const n = idx + 1;
-      if (visitStamp[n] !== stamp && !blocked.has(coordKeyFromIdx(n, width))) {
+      if (visitStamp[n] !== stamp && !blocked.has(n)) {
         visitStamp[n] = stamp;
         queue[qt++] = n;
       }
@@ -262,25 +256,32 @@ function pathToDirection(head: Coord, firstStep: Coord): Direction | null {
   return null;
 }
 
-function getHazardSet(gameState: GameState): Set<string> {
-  const hazards = new Set<string>();
+function getHazardSet(gameState: GameState): Set<number> {
+  const hazards = new Set<number>();
+  const w = gameState.board.width;
   for (const h of gameState.board.hazards) {
-    hazards.add(coordKey(h));
+    hazards.add(cellIndex(h, w));
   }
   return hazards;
 }
 
-/** For each cell an opponent head could move to next turn, track the longest opponent that could arrive. */
-function getOpponentPossibleHeadMoves(gameState: GameState): Map<string, number> {
-  const result = new Map<string, number>();
+/**
+ * For each cell an opponent head could move to next turn, track the longest opponent that could arrive.
+ * Skips illegal backward moves into the neck (same rule as our snake).
+ */
+function getOpponentPossibleHeadMoves(gameState: GameState): Map<number, number> {
+  const result = new Map<number, number>();
   const { board, you } = gameState;
+  const { width, height } = board;
   for (const snake of board.snakes) {
     if (snake.id === you.id) continue;
+    const neck = snake.body.length >= 2 ? snake.body[1] : null;
     for (const dir of DIRECTIONS) {
       const next = getNeighbor(snake.head, dir);
-      if (!inBounds(next, board.width, board.height)) continue;
-      const key = coordKey(next);
-      result.set(key, Math.max(result.get(key) ?? 0, snake.length));
+      if (!inBounds(next, width, height)) continue;
+      if (neck !== null && next.x === neck.x && next.y === neck.y) continue;
+      const idx = cellIndex(next, width);
+      result.set(idx, Math.max(result.get(idx) ?? 0, snake.length));
     }
   }
   return result;
@@ -343,7 +344,7 @@ function move(gameState: GameState): MoveResponse {
       isMoveSafe[dir] = false;
       continue;
     }
-    if (blocked.has(coordKey(next))) {
+    if (blocked.has(cellIndex(next, width))) {
       isMoveSafe[dir] = false;
     }
   }
@@ -415,7 +416,7 @@ function move(gameState: GameState): MoveResponse {
     }
   }
 
-  const onHazard = hazardSet.has(coordKey(myHead));
+  const onHazard = hazardSet.has(cellIndex(myHead, width));
   const adjustedThreshold = onHazard
     ? Math.min(HEALTH_FOOD_THRESHOLD + hazardDmg * 3, 100)
     : HEALTH_FOOD_THRESHOLD;
@@ -431,7 +432,7 @@ function move(gameState: GameState): MoveResponse {
   }[] = [];
   for (const dir of safeMoves) {
     const nextHead = getNeighbor(myHead, dir);
-    const nextKey = coordKey(nextHead);
+    const nextIdx = cellIndex(nextHead, width);
     const space = floodFillCount(
       nextHead,
       width,
@@ -443,10 +444,10 @@ function move(gameState: GameState): MoveResponse {
     );
     if (space < MIN_FLOOD_FILL_SPACE) continue;
 
-    const hazardCost = hazardSet.has(nextKey) ? Math.max(hazardDmg, 1) : 0;
+    const hazardCost = hazardSet.has(nextIdx) ? Math.max(hazardDmg, 1) : 0;
 
     let headToHeadScore = 0;
-    const opponentMaxLength = opponentHeadMoves.get(nextKey);
+    const opponentMaxLength = opponentHeadMoves.get(nextIdx);
     if (opponentMaxLength !== undefined) {
       headToHeadScore = you.length > opponentMaxLength
         ? HEAD_TO_HEAD_KILL_BONUS
