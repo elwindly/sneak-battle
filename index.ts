@@ -122,17 +122,26 @@ function getBlockedSet(gameState: GameState, excludeMyTail: boolean): Set<string
   return blocked;
 }
 
-/** A*: shortest path from start to goal. Returns array of coords (start not included), or empty if no path. */
+function manhattan(a: Coord, b: Coord): number {
+  return Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
+}
+
+/**
+ * A*: minimum-cost path from start to goal with per-step cost 1 plus hazard damage on the entered cell.
+ * Returns coords from the first step after start through goal; `effectiveCost` is total cost (0 if no path).
+ */
 function aStarPath(
   start: Coord,
   goal: Coord,
   width: number,
   height: number,
-  blocked: Set<string>
-): Coord[] {
+  blocked: Set<string>,
+  hazardSet: Set<string>,
+  hazardDamagePerTurn: number
+): { path: Coord[]; effectiveCost: number } {
   const goalIdx = cellIndex(goal, width);
   const startIdx = cellIndex(start, width);
-  const heuristic = (c: Coord) => Math.abs(c.x - goal.x) + Math.abs(c.y - goal.y);
+  const heuristic = (c: Coord) => manhattan(c, goal);
   const open = new MinFHeap();
   const cameFrom = new Map<number, number>();
   const gScore = new Map<number, number>();
@@ -140,6 +149,8 @@ function aStarPath(
   open.push({ idx: startIdx, g: 0, f: heuristic(start) });
 
   const blockedAt = (c: Coord) => blocked.has(coordKey(c));
+  const stepCost = (nextIdx: number) =>
+    1 + (hazardSet.has(coordKeyFromIdx(nextIdx, width)) ? hazardDamagePerTurn : 0);
 
   while (open.length > 0) {
     const node = open.pop()!;
@@ -153,7 +164,7 @@ function aStarPath(
         path.unshift(indexToCoord(cur, width));
         cur = cameFrom.get(cur)!;
       }
-      return path;
+      return { path, effectiveCost: currentG };
     }
 
     const cx = currentIdx % width;
@@ -167,14 +178,15 @@ function aStarPath(
     for (const next of neighbors) {
       if (!inBounds(next, width, height) || blockedAt(next)) continue;
       const nextIdx = cellIndex(next, width);
-      const tentativeG = currentG + 1;
+      const edge = stepCost(nextIdx);
+      const tentativeG = currentG + edge;
       if (tentativeG >= (gScore.get(nextIdx) ?? Infinity)) continue;
       cameFrom.set(nextIdx, currentIdx);
       gScore.set(nextIdx, tentativeG);
       open.push({ idx: nextIdx, g: tentativeG, f: tentativeG + heuristic(next) });
     }
   }
-  return [];
+  return { path: [], effectiveCost: 0 };
 }
 
 /**
@@ -356,16 +368,30 @@ function move(gameState: GameState): MoveResponse {
   const hazardSet = getHazardSet(gameState);
   const opponentHeadMoves = getOpponentPossibleHeadMoves(gameState);
 
-  // Food seeking: shortest reachable path, accounting for hazard damage along the way
+  // Food seeking: minimum effective-cost path (hazard-aware A*), foods tried nearest Manhattan first for pruning
   let bestFoodDirection: Direction | null = null;
   if (food.length > 0) {
+    const foodsByDistance = [...food].sort(
+      (a, b) => manhattan(a, myHead) - manhattan(b, myHead)
+    );
+    let bestEffectiveCost = Infinity;
     let bestPathLength = Infinity;
-    for (const f of food) {
-      const path = aStarPath(myHead, f, width, height, blocked);
+    for (const f of foodsByDistance) {
+      const lowerBound = manhattan(f, myHead);
+      if (lowerBound >= bestEffectiveCost) continue;
+
+      const { path, effectiveCost } = aStarPath(
+        myHead,
+        f,
+        width,
+        height,
+        blocked,
+        hazardSet,
+        hazardDmg
+      );
       if (path.length === 0) continue;
-      const hazardSteps = path.filter((c) => hazardSet.has(coordKey(c))).length;
-      const effectiveCost = path.length + hazardSteps * hazardDmg;
       if (effectiveCost >= you.health) continue;
+
       const spaceAtFood = floodFillCount(
         f,
         width,
@@ -377,7 +403,12 @@ function move(gameState: GameState): MoveResponse {
         MIN_SPACE_AROUND_FOOD
       );
       if (spaceAtFood < MIN_SPACE_AROUND_FOOD) continue;
-      if (path.length < bestPathLength) {
+
+      const better =
+        effectiveCost < bestEffectiveCost ||
+        (effectiveCost === bestEffectiveCost && path.length < bestPathLength);
+      if (better) {
+        bestEffectiveCost = effectiveCost;
         bestPathLength = path.length;
         bestFoodDirection = pathToDirection(myHead, path[0]);
       }
